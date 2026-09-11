@@ -1,0 +1,450 @@
+import requests
+import hashlib
+import json
+
+from datetime import datetime, timezone
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    LongType,
+    TimestampType
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+population_api_url = (
+    "https://honolulu-api.datausa.io/tesseract/data.jsonrecords"
+    "?cube=acs_yg_total_population_1"
+    "&drilldowns=Year%2CNation"
+    "&locale=en"
+    "&measures=Population"
+)
+
+source_name = "datausa"
+source_object = "population.json"
+
+landing_dir = "/Volumes/rearc/bronze/raw/population/inbound"
+
+manifest_table = "rearc.audit.ingestion_manifest"
+
+
+# ============================================================
+# CALL DATA USA API
+# ============================================================
+
+response = requests.get(
+    population_api_url,
+    timeout=60
+)
+
+response.raise_for_status()
+
+population_payload = response.json()
+
+
+# ============================================================
+# VALIDATE RESPONSE
+# ============================================================
+
+if "data" not in population_payload:
+    raise ValueError(
+        "Population API response does not contain expected 'data' element."
+    )
+
+print(
+    "Population rows received:",
+    len(population_payload["data"])
+)
+
+
+# ============================================================
+# CREATE DETERMINISTIC JSON
+# ============================================================
+
+population_json = json.dumps(
+    population_payload,
+    sort_keys=True,
+    separators=(",", ":")
+)
+
+
+# ============================================================
+# CONTENT HASH
+# ============================================================
+
+content_hash = hashlib.sha256(
+    population_json.encode("utf-8")
+).hexdigest()
+
+
+# ============================================================
+# READ EXISTING MANIFEST
+# ============================================================
+
+df_manifest = (
+    spark.table(manifest_table)
+    .filter(
+        (F.col("source_name") == source_name)
+        &
+        (F.col("source_object") == source_object)
+    )
+)
+
+manifest_rows = df_manifest.collect()
+
+
+existing_hash = None
+
+if len(manifest_rows) > 0:
+    existing_hash = manifest_rows[0]["content_hash"]
+
+
+# ============================================================
+# CHECK WHETHER PAYLOAD CHANGED
+# ============================================================
+
+is_changed = existing_hash != content_hash
+
+
+print("Existing hash :", existing_hash)
+print("Current hash  :", content_hash)
+print("Changed       :", is_changed)
+
+
+# ============================================================
+# CURRENT TIMESTAMP
+# ============================================================
+
+current_dt = datetime.now(timezone.utc)
+
+
+# ============================================================
+# UNCHANGED
+# ============================================================
+
+if not is_changed:
+
+    print(
+        "Population payload unchanged - "
+        "raw file not rewritten"
+    )
+
+    spark.sql(
+        f"""
+        UPDATE {manifest_table}
+
+        SET
+            last_seen_dt = current_timestamp(),
+            status = 'active'
+
+        WHERE source_name = '{source_name}'
+          AND source_object = '{source_object}'
+        """
+    )
+
+
+# ============================================================
+# NEW OR CHANGED
+# ============================================================
+
+else:
+
+    # --------------------------------------------------------
+    # VERSION
+    # --------------------------------------------------------
+
+    version_timestamp = current_dt.strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+
+
+    version_dir = (
+        f"{landing_dir}/"
+        f"population/"
+        f"v={version_timestamp}"
+    )
+
+
+    volume_path = (
+        f"{version_dir}/"
+        f"{source_object}"
+    )
+
+
+    print(
+        "New or changed population payload detected"
+    )
+
+    print(
+        "Writing raw payload to:",
+        volume_path
+    )
+
+
+    # --------------------------------------------------------
+    # WRITE RAW FILE
+    # --------------------------------------------------------
+
+    dbutils.fs.mkdirs(
+        version_dir
+    )
+
+
+    dbutils.fs.put(
+        volume_path,
+        population_json,
+        overwrite=False
+    )
+
+
+    print(
+        "Population raw file written successfully"
+    )
+
+
+    # --------------------------------------------------------
+    # SOURCE SIZE
+    # --------------------------------------------------------
+
+    source_size = len(
+        population_json.encode("utf-8")
+    )
+
+
+    # ========================================================
+    # MANIFEST SCHEMA
+    # ========================================================
+
+    manifest_schema = StructType([
+        StructField(
+            "source_name",
+            StringType(),
+            False
+        ),
+
+        StructField(
+            "source_object",
+            StringType(),
+            False
+        ),
+
+        StructField(
+            "source_url",
+            StringType(),
+            True
+        ),
+
+        StructField(
+            "source_modified_dt",
+            TimestampType(),
+            True
+        ),
+
+        StructField(
+            "source_size",
+            LongType(),
+            True
+        ),
+
+        StructField(
+            "content_hash",
+            StringType(),
+            True
+        ),
+
+        StructField(
+            "volume_path",
+            StringType(),
+            True
+        ),
+
+        StructField(
+            "status",
+            StringType(),
+            True
+        ),
+
+        StructField(
+            "first_seen_dt",
+            TimestampType(),
+            True
+        ),
+
+        StructField(
+            "last_seen_dt",
+            TimestampType(),
+            True
+        ),
+
+        StructField(
+            "ingested_dt",
+            TimestampType(),
+            True
+        ),
+
+        StructField(
+            "landing_dir",
+            StringType(),
+            True
+        )
+    ])
+
+
+    # ========================================================
+    # MANIFEST RECORD
+    # ========================================================
+
+    manifest_update = [
+        (
+            source_name,
+            source_object,
+            population_api_url,
+            None,
+            source_size,
+            content_hash,
+            volume_path,
+            "active",
+            current_dt,
+            current_dt,
+            current_dt,
+            landing_dir
+        )
+    ]
+
+
+    df_manifest_update = spark.createDataFrame(
+        manifest_update,
+        schema=manifest_schema
+    )
+
+
+    # ========================================================
+    # TEMP VIEW
+    # ========================================================
+
+    df_manifest_update.createOrReplaceTempView(
+        "population_manifest_update"
+    )
+
+
+    # ========================================================
+    # MERGE INTO MANIFEST
+    # ========================================================
+
+    spark.sql(
+        f"""
+        MERGE INTO {manifest_table} AS tgt
+
+        USING population_manifest_update AS src
+
+        ON  tgt.source_name = src.source_name
+        AND tgt.source_object = src.source_object
+
+
+        WHEN MATCHED THEN
+
+        UPDATE SET
+
+            tgt.source_url =
+                src.source_url,
+
+            tgt.source_modified_dt =
+                src.source_modified_dt,
+
+            tgt.source_size =
+                src.source_size,
+
+            tgt.content_hash =
+                src.content_hash,
+
+            tgt.volume_path =
+                src.volume_path,
+
+            tgt.status =
+                src.status,
+
+            tgt.last_seen_dt =
+                src.last_seen_dt,
+
+            tgt.ingested_dt =
+                src.ingested_dt,
+
+            tgt.landing_dir =
+                src.landing_dir
+
+
+        WHEN NOT MATCHED THEN
+
+        INSERT
+        (
+            source_name,
+            source_object,
+            source_url,
+            source_modified_dt,
+            source_size,
+            content_hash,
+            volume_path,
+            status,
+            first_seen_dt,
+            last_seen_dt,
+            ingested_dt,
+            landing_dir
+        )
+
+        VALUES
+        (
+            src.source_name,
+            src.source_object,
+            src.source_url,
+            src.source_modified_dt,
+            src.source_size,
+            src.content_hash,
+            src.volume_path,
+            src.status,
+            src.first_seen_dt,
+            src.last_seen_dt,
+            src.ingested_dt,
+            src.landing_dir
+        )
+        """
+    )
+
+
+    print(
+        "Manifest updated successfully"
+    )
+
+
+# ============================================================
+# VALIDATE FINAL MANIFEST
+# ============================================================
+
+df_population_manifest = (
+    spark.table(manifest_table)
+    .filter(
+        (F.col("source_name") == source_name)
+        &
+        (F.col("source_object") == source_object)
+    )
+    .select(
+        "source_name",
+        "source_object",
+        "source_size",
+        "content_hash",
+        "volume_path",
+        "status",
+        "first_seen_dt",
+        "last_seen_dt",
+        "ingested_dt",
+        "landing_dir"
+    )
+)
+
+
+display(df_population_manifest)
